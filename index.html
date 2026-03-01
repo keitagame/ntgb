@@ -1,0 +1,1468 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>GBMU</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="icon" href="nes.png" type="image/png">
+    <style>
+       :root {
+        color-scheme: light;
+      }
+      @font-face {
+  font-family: "Renner";
+  src: url("./Renner.ttf") format("truetype");
+  font-display: swap;
+}
+      body {
+        background:rgb(255, 255, 255);
+       font-family: "Renner", sans-serif;
+        margin: 0;
+        padding:0;
+      }
+h1{
+font-weight:300;
+font-size:25px;
+}
+      header {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      canvas{
+        height: 100%;
+      aspect-ratio: 160 / 144;
+        image-rendering: pixelated;
+        border: 1px solid #000000;
+        background: #000;
+      }
+      .row {
+        padding-top:0px;
+height:83vh;
+justify-content: center; 
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .mono {
+       font-size:20px; 
+      }
+      small {
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>GAMEBOY</h1>
+      <input id="rom" type="file" class="file-input" accept=".gb,.gbc">
+      <span id="file-name"></span>
+      <button id="fullscreenBtn">Fullscreen</button>
+      <button id="start">Start</button>
+      <div class="mono" id="status" style="display:none">No ROM</div>
+      <div><span class="mono">CPU PC:</span> <span id="pc" class="mono">0x0000</span></div>
+    </header>
+    <div class="row">
+      <canvas id="screen" width="160" height="144"></canvas>
+    </div>
+
+    <canvas id="rec" width="480" height="432" style="display:none"></canvas>
+
+    <script type="module">
+// ============================================================
+//  Game Boy (DMG) Emulator — Complete JavaScript Implementation
+// ============================================================
+
+// ---- Constants ----
+const SCREEN_W = 160;
+const SCREEN_H = 144;
+const GB_FREQ   = 4194304; // Hz
+const FRAME_CYCLES = 70224; // cycles per frame
+
+// ---- Palette (4 shades, RGBA) ----
+const DMG_PALETTE = [
+  0xE0F8D0FF, // 0: lightest
+  0x88C070FF, // 1
+  0x346856FF, // 2
+  0x081820FF, // 3: darkest
+];
+
+function paletteColor(shade) {
+  const c = DMG_PALETTE[shade & 3] >>> 0;
+  return [(c>>>24)&0xff, (c>>>16)&0xff, (c>>>8)&0xff, c&0xff];
+}
+
+// ---- Cartridge / MBC ----
+class Cartridge {
+  constructor(data) {
+    this.rom = data;
+    this.title = '';
+    for (let i = 0x134; i < 0x143; i++) {
+      const c = data[i];
+      if (c === 0) break;
+      this.title += String.fromCharCode(c);
+    }
+    this.mbcType = data[0x147];
+    this.romSize = data[0x148];
+    this.ramSize = data[0x149];
+
+    // RAM init
+    const ramSizes = [0, 0, 8*1024, 32*1024, 128*1024, 64*1024];
+    const ramBytes = ramSizes[this.ramSize] || 0;
+    this.ram = new Uint8Array(Math.max(ramBytes, 0x2000));
+
+    // MBC state
+    this.romBank  = 1;
+    this.ramBank  = 0;
+    this.ramEnabled = false;
+    this.mode     = 0; // MBC1 mode
+    this.rtcReg   = 0;
+    this.latchedRTC = new Uint8Array(5);
+    this.rtcLatchPrev = 0xFF;
+
+    // MBC3 RTC registers (seconds, minutes, hours, days-lo, days-hi)
+    this.rtcData = new Uint8Array(5);
+
+    this.numRomBanks = Math.max(2, this.rom.length >> 14); // 16KB banks
+  }
+
+  read(addr) {
+    addr &= 0xFFFF;
+    if (addr < 0x4000) {
+      // ROM bank 0
+      return this.rom[addr] || 0;
+    }
+    if (addr < 0x8000) {
+      // Switchable ROM bank
+      let bank = this.romBank % this.numRomBanks;
+      return this.rom[(bank * 0x4000) + (addr - 0x4000)] || 0;
+    }
+    if (addr >= 0xA000 && addr < 0xC000) {
+      // External RAM
+      if (!this.ramEnabled) return 0xFF;
+      // MBC3 RTC
+      if ((this.mbcType >= 0x0F && this.mbcType <= 0x13) && this.ramBank >= 0x08) {
+        return this.latchedRTC[this.ramBank - 0x08] || 0;
+      }
+      const off = (this.ramBank * 0x2000) + (addr - 0xA000);
+      return this.ram[off % this.ram.length] || 0;
+    }
+    return 0xFF;
+  }
+
+  write(addr, val) {
+    addr &= 0xFFFF; val &= 0xFF;
+    const type = this.mbcType;
+
+    // MBC0 (ROM only)
+    if (type === 0x00) return;
+
+    // MBC1
+    if (type >= 0x01 && type <= 0x03) {
+      if (addr < 0x2000) {
+        this.ramEnabled = (val & 0x0F) === 0x0A;
+      } else if (addr < 0x4000) {
+        let bank = val & 0x1F;
+        if (bank === 0) bank = 1;
+        this.romBank = (this.romBank & 0x60) | bank;
+      } else if (addr < 0x6000) {
+        if (this.mode === 0) {
+          this.romBank = (this.romBank & 0x1F) | ((val & 0x03) << 5);
+        } else {
+          this.ramBank = val & 0x03;
+        }
+      } else if (addr < 0x8000) {
+        this.mode = val & 0x01;
+      } else if (addr >= 0xA000 && addr < 0xC000) {
+        if (!this.ramEnabled) return;
+        const off = (this.ramBank * 0x2000) + (addr - 0xA000);
+        this.ram[off % this.ram.length] = val;
+      }
+      return;
+    }
+
+    // MBC2
+    if (type === 0x05 || type === 0x06) {
+      if (addr < 0x4000) {
+        if (addr & 0x0100) {
+          let bank = val & 0x0F;
+          if (bank === 0) bank = 1;
+          this.romBank = bank;
+        } else {
+          this.ramEnabled = (val & 0x0F) === 0x0A;
+        }
+      } else if (addr >= 0xA000 && addr < 0xC000) {
+        if (!this.ramEnabled) return;
+        this.ram[(addr - 0xA000) & 0x1FF] = val & 0x0F;
+      }
+      return;
+    }
+
+    // MBC3
+    if (type >= 0x0F && type <= 0x13) {
+      if (addr < 0x2000) {
+        this.ramEnabled = (val & 0x0F) === 0x0A;
+      } else if (addr < 0x4000) {
+        let bank = val & 0x7F;
+        if (bank === 0) bank = 1;
+        this.romBank = bank;
+      } else if (addr < 0x6000) {
+        this.ramBank = val;
+      } else if (addr < 0x8000) {
+        // RTC latch
+        if (this.rtcLatchPrev === 0 && val === 1) {
+          this.latchedRTC.set(this.rtcData);
+        }
+        this.rtcLatchPrev = val;
+      } else if (addr >= 0xA000 && addr < 0xC000) {
+        if (!this.ramEnabled) return;
+        if (this.ramBank >= 0x08 && this.ramBank <= 0x0C) {
+          this.rtcData[this.ramBank - 0x08] = val;
+        } else {
+          const off = (this.ramBank * 0x2000) + (addr - 0xA000);
+          this.ram[off % this.ram.length] = val;
+        }
+      }
+      return;
+    }
+
+    // MBC5
+    if (type >= 0x19 && type <= 0x1E) {
+      if (addr < 0x2000) {
+        this.ramEnabled = (val & 0x0F) === 0x0A;
+      } else if (addr < 0x3000) {
+        this.romBank = (this.romBank & 0x100) | val;
+      } else if (addr < 0x4000) {
+        this.romBank = (this.romBank & 0xFF) | ((val & 0x01) << 8);
+      } else if (addr < 0x6000) {
+        this.ramBank = val & 0x0F;
+      } else if (addr >= 0xA000 && addr < 0xC000) {
+        if (!this.ramEnabled) return;
+        const off = (this.ramBank * 0x2000) + (addr - 0xA000);
+        this.ram[off % this.ram.length] = val;
+      }
+      return;
+    }
+  }
+}
+
+// ---- PPU ----
+class PPU {
+  constructor(gb) {
+    this.gb = gb;
+    this.vram = new Uint8Array(0x2000);
+    this.oam  = new Uint8Array(0xA0);
+    this.framebuffer = new Uint32Array(SCREEN_W * SCREEN_H); // RGBA packed
+    this.frameReady  = false;
+
+    // Registers
+    this.LCDC = 0x91; // LCD Control
+    this.STAT = 0x85; // LCD Status
+    this.SCY  = 0;
+    this.SCX  = 0;
+    this.LY   = 0;
+    this.LYC  = 0;
+    this.WY   = 0;
+    this.WX   = 0;
+    this.BGP  = 0xFC;
+    this.OBP0 = 0xFF;
+    this.OBP1 = 0xFF;
+    this.DMA  = 0;
+
+    this.cycles = 0;
+    this.windowLine = 0;
+    this.mode = 2; // OAM search initially
+  }
+
+  read(addr) {
+    if (addr >= 0x8000 && addr < 0xA000) return this.vram[addr - 0x8000];
+    if (addr >= 0xFE00 && addr < 0xFEA0) return this.oam[addr - 0xFE00];
+    switch(addr) {
+      case 0xFF40: return this.LCDC;
+      case 0xFF41: return (this.STAT & 0xF8) | (this.LY === this.LYC ? 4 : 0) | this.mode;
+      case 0xFF42: return this.SCY;
+      case 0xFF43: return this.SCX;
+      case 0xFF44: return this.LY;
+      case 0xFF45: return this.LYC;
+      case 0xFF46: return this.DMA;
+      case 0xFF47: return this.BGP;
+      case 0xFF48: return this.OBP0;
+      case 0xFF49: return this.OBP1;
+      case 0xFF4A: return this.WY;
+      case 0xFF4B: return this.WX;
+    }
+    return 0xFF;
+  }
+
+  write(addr, val) {
+    if (addr >= 0x8000 && addr < 0xA000) { this.vram[addr - 0x8000] = val; return; }
+    if (addr >= 0xFE00 && addr < 0xFEA0) { this.oam[addr - 0xFE00] = val; return; }
+    switch(addr) {
+      case 0xFF40: this.LCDC = val; break;
+      case 0xFF41: this.STAT = (this.STAT & 0x07) | (val & 0xF8); break;
+      case 0xFF42: this.SCY = val; break;
+      case 0xFF43: this.SCX = val; break;
+      case 0xFF44: break; // read-only
+      case 0xFF45: this.LYC = val; break;
+      case 0xFF46: this.DMA = val; this.doDMA(val); break;
+      case 0xFF47: this.BGP  = val; break;
+      case 0xFF48: this.OBP0 = val; break;
+      case 0xFF49: this.OBP1 = val; break;
+      case 0xFF4A: this.WY = val; break;
+      case 0xFF4B: this.WX = val; break;
+    }
+  }
+
+  doDMA(val) {
+    const src = val << 8;
+    for (let i = 0; i < 0xA0; i++) {
+      this.oam[i] = this.gb.mmu.read(src + i);
+    }
+  }
+
+  // Called every CPU T-cycle (4 T-cycles = 1 M-cycle)
+  step(tCycles) {
+    if (!(this.LCDC & 0x80)) {
+      this.LY = 0;
+      this.mode = 0;
+      return;
+    }
+
+    this.cycles += tCycles;
+
+    switch (this.mode) {
+      case 2: // OAM Search (80 T)
+        if (this.cycles >= 80) {
+          this.cycles -= 80;
+          this.setMode(3);
+        }
+        break;
+      case 3: // Drawing (172 T)
+        if (this.cycles >= 172) {
+          this.cycles -= 172;
+          this.renderScanline();
+          this.setMode(0);
+          if (this.STAT & 0x08) this.gb.mmu.requestInterrupt(1); // STAT HBlank
+        }
+        break;
+      case 0: // HBlank (204 T)
+        if (this.cycles >= 204) {
+          this.cycles -= 204;
+          this.LY++;
+          this.checkLYC();
+          if (this.LY === 144) {
+            this.setMode(1); // VBlank
+            this.gb.mmu.requestInterrupt(0); // VBlank interrupt
+            this.frameReady = true;
+            this.windowLine = 0;
+          } else {
+            this.setMode(2);
+            if (this.STAT & 0x20) this.gb.mmu.requestInterrupt(1);
+          }
+        }
+        break;
+      case 1: // VBlank (4560 T total, 10 lines)
+        if (this.cycles >= 456) {
+          this.cycles -= 456;
+          this.LY++;
+          this.checkLYC();
+          if (this.LY === 154) {
+            this.LY = 0;
+            this.checkLYC();
+            this.setMode(2);
+            if (this.STAT & 0x20) this.gb.mmu.requestInterrupt(1);
+          }
+        }
+        break;
+    }
+  }
+
+  setMode(m) {
+    this.mode = m;
+  }
+
+  checkLYC() {
+    if (this.LY === this.LYC) {
+      this.STAT |= 0x04;
+      if (this.STAT & 0x40) this.gb.mmu.requestInterrupt(1);
+    } else {
+      this.STAT &= ~0x04;
+    }
+  }
+
+  consumeFrame() {
+    if (this.frameReady) { this.frameReady = false; return true; }
+    return false;
+  }
+
+  renderScanline() {
+    const ly = this.LY;
+    if (ly >= SCREEN_H) return;
+
+    const lcdc = this.LCDC;
+    const bgEnabled   = !!(lcdc & 0x01);
+    const objEnabled  = !!(lcdc & 0x02);
+    const objSize     = (lcdc & 0x04) ? 16 : 8; // tall sprite
+    const bgMapBase   = (lcdc & 0x08) ? 0x1C00 : 0x1800;
+    const tileDataSigned = !(lcdc & 0x10);
+    const winEnabled  = !!(lcdc & 0x20);
+    const winMapBase  = (lcdc & 0x40) ? 0x1C00 : 0x1800;
+
+    // BG / Window line buffer (shade 0-3, and priority flag)
+    const bgBuf   = new Uint8Array(SCREEN_W);
+    const bgPrio  = new Uint8Array(SCREEN_W); // 1 = BG priority
+
+    // ---- Draw BG ----
+    if (bgEnabled) {
+      const scy = this.SCY, scx = this.SCX;
+      const y   = (ly + scy) & 0xFF;
+      const tileRow = (y >> 3) & 31;
+
+      for (let x = 0; x < SCREEN_W; x++) {
+        const screenX = (x + scx) & 0xFF;
+        const tileCol = (screenX >> 3) & 31;
+        const mapAddr = bgMapBase + tileRow * 32 + tileCol;
+        let tileNum = this.vram[mapAddr];
+        let tileAddr;
+        if (tileDataSigned) {
+          tileAddr = 0x1000 + ((tileNum << 24) >> 24) * 16;
+        } else {
+          tileAddr = tileNum * 16;
+        }
+        const line  = (y & 7) * 2;
+        const lo    = this.vram[tileAddr + line];
+        const hi    = this.vram[tileAddr + line + 1];
+        const bit   = 7 - (screenX & 7);
+        const shade = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+        bgBuf[x]   = (this.BGP >> (shade * 2)) & 3;
+        bgPrio[x]  = shade === 0 ? 0 : 1;
+      }
+    }
+
+    // ---- Draw Window ----
+    if (winEnabled && ly >= this.WY) {
+      const wx = this.WX - 7;
+      const wy = this.windowLine;
+      if (wx < SCREEN_W) {
+        const tileRow = (wy >> 3) & 31;
+        for (let x = Math.max(0, wx); x < SCREEN_W; x++) {
+          const winX = x - wx;
+          const tileCol = (winX >> 3) & 31;
+          const mapAddr = winMapBase + tileRow * 32 + tileCol;
+          let tileNum = this.vram[mapAddr];
+          let tileAddr;
+          if (tileDataSigned) {
+            tileAddr = 0x1000 + ((tileNum << 24) >> 24) * 16;
+          } else {
+            tileAddr = tileNum * 16;
+          }
+          const line  = (wy & 7) * 2;
+          const lo    = this.vram[tileAddr + line];
+          const hi    = this.vram[tileAddr + line + 1];
+          const bit   = 7 - (winX & 7);
+          const shade = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+          bgBuf[x]   = (this.BGP >> (shade * 2)) & 3;
+          bgPrio[x]  = shade === 0 ? 0 : 1;
+        }
+        this.windowLine++;
+      }
+    }
+
+    // ---- Collect sprites ----
+    const sprites = [];
+    if (objEnabled) {
+      for (let i = 0; i < 40 && sprites.length < 10; i++) {
+        const base = i * 4;
+        const sy = this.oam[base]     - 16;
+        const sx = this.oam[base + 1] - 8;
+        const ti = this.oam[base + 2];
+        const at = this.oam[base + 3];
+        if (ly >= sy && ly < sy + objSize) {
+          sprites.push({ sy, sx, ti, at });
+        }
+      }
+      // Priority: lower X wins; stable sort by OAM index already
+      sprites.sort((a, b) => a.sx - b.sx);
+    }
+
+    // ---- Compose final line ----
+    const base = ly * SCREEN_W;
+    for (let x = 0; x < SCREEN_W; x++) {
+      let shade = bgBuf[x];
+
+      // Sprite
+      for (let s = 0; s < sprites.length; s++) {
+        const sp = sprites[s];
+        if (x < sp.sx || x >= sp.sx + 8) continue;
+
+        const bgPriority  = !!(sp.at & 0x80);
+        const yFlip       = !!(sp.at & 0x40);
+        const xFlip       = !!(sp.at & 0x20);
+        const palette     = (sp.at & 0x10) ? this.OBP1 : this.OBP0;
+
+        let spriteY = ly - sp.sy;
+        if (yFlip) spriteY = (objSize - 1) - spriteY;
+
+        let tileIdx = sp.ti;
+        if (objSize === 16) tileIdx &= 0xFE;
+
+        const tileAddr = tileIdx * 16 + spriteY * 2;
+        let bit = 7 - (x - sp.sx);
+        if (xFlip) bit = 7 - bit;
+
+        const lo = this.vram[tileAddr];
+        const hi = this.vram[tileAddr + 1];
+        const spShade = (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
+
+        if (spShade === 0) continue; // transparent
+        if (bgPriority && bgPrio[x]) continue; // BG wins
+
+        shade = (palette >> (spShade * 2)) & 3;
+        break;
+      }
+
+      const [r, g, b, a] = paletteColor(shade);
+      this.framebuffer[base + x] = ((r << 24) | (g << 16) | (b << 8) | a) >>> 0;
+    }
+  }
+}
+
+// ---- Timer ----
+class Timer {
+  constructor(gb) {
+    this.gb = gb;
+    this.DIV  = 0; // internal 16-bit counter; high byte = FF04
+    this.TIMA = 0;
+    this.TMA  = 0;
+    this.TAC  = 0;
+  }
+
+  read(addr) {
+    switch(addr) {
+      case 0xFF03: return (this.DIV >> 8) & 0xFF;
+      case 0xFF04: return (this.DIV >> 8) & 0xFF;
+      case 0xFF05: return this.TIMA;
+      case 0xFF06: return this.TMA;
+      case 0xFF07: return this.TAC | 0xF8;
+    }
+    return 0xFF;
+  }
+
+  write(addr, val) {
+    switch(addr) {
+      case 0xFF04: this.DIV = 0; break;
+      case 0xFF05: this.TIMA = val; break;
+      case 0xFF06: this.TMA  = val; break;
+      case 0xFF07: this.TAC  = val & 0x07; break;
+    }
+  }
+
+  // tCycles = T-cycles elapsed
+  step(tCycles) {
+    const prevDIV = this.DIV;
+    this.DIV = (this.DIV + tCycles) & 0xFFFF;
+
+    if (!(this.TAC & 0x04)) return; // timer stopped
+
+    const thresholds = [512, 8, 32, 128]; // in T-cycles (bit positions 9,3,5,7)
+    const bits = [9, 3, 5, 7];
+    const bit  = bits[this.TAC & 0x03];
+
+    // Count how many falling edges occurred on the selected bit
+    for (let t = 0; t < tCycles; t++) {
+      const div = (prevDIV + t) & 0xFFFF;
+      const nxt = (div + 1) & 0xFFFF;
+      if ((div >> bit) & 1 && !((nxt >> bit) & 1)) {
+        this.TIMA = (this.TIMA + 1) & 0xFF;
+        if (this.TIMA === 0) {
+          this.TIMA = this.TMA;
+          this.gb.mmu.requestInterrupt(2); // Timer
+        }
+      }
+    }
+  }
+}
+
+// ---- APU (minimal – square + noise) ----
+class APU {
+  constructor(gb) {
+    this.gb = gb;
+    this.regs = new Uint8Array(0x30);
+    this.enabled = false;
+    this.audioCtx = null;
+    this.gainNode = null;
+    this.nextFrameTime = 0;
+    this.sampleRate = 44100;
+    this.bufferSize = 1024;
+    this.sampleBuffer = new Float32Array(this.bufferSize);
+    this.samplePos = 0;
+    this.cycleAccum = 0;
+    this.cyclesPerSample = GB_FREQ / this.sampleRate;
+
+    // CH1 state
+    this.ch1_freq = 0;
+    this.ch1_duty = 0;
+    this.ch1_phase = 0;
+    this.ch1_vol = 0;
+    this.ch1_env_vol = 0;
+    this.ch1_env_timer = 0;
+    this.ch1_on = false;
+
+    // CH2 state
+    this.ch2_freq = 0;
+    this.ch2_duty = 0;
+    this.ch2_phase = 0;
+    this.ch2_vol = 0;
+    this.ch2_env_vol = 0;
+    this.ch2_on = false;
+
+    // Frame sequencer
+    this.frameSeqCycles = 0;
+    this.frameSeqStep = 0;
+  }
+
+  initAudio() {
+    try {
+      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: this.sampleRate });
+      this.gainNode = this.audioCtx.createGain();
+      this.gainNode.gain.value = 0.25;
+      this.gainNode.connect(this.audioCtx.destination);
+      this.nextFrameTime = this.audioCtx.currentTime;
+    } catch(e) {}
+  }
+
+  read(addr) {
+    if (addr >= 0xFF10 && addr < 0xFF40) return this.regs[addr - 0xFF10] | 0;
+    return 0xFF;
+  }
+
+  write(addr, val) {
+    if (addr < 0xFF10 || addr >= 0xFF40) return;
+    this.regs[addr - 0xFF10] = val;
+
+    // CH1 trigger
+    if (addr === 0xFF14 && (val & 0x80)) {
+      const freqLo = this.regs[3];
+      const freqHi = this.regs[4] & 0x07;
+      const freq   = (freqHi << 8) | freqLo;
+      this.ch1_freq = 131072 / (2048 - freq);
+      this.ch1_duty = (this.regs[1] >> 6) & 0x03;
+      this.ch1_env_vol = (this.regs[2] >> 4) & 0x0F;
+      this.ch1_on  = true;
+    }
+    // CH2 trigger
+    if (addr === 0xFF19 && (val & 0x80)) {
+      const freqLo = this.regs[8];
+      const freqHi = this.regs[9] & 0x07;
+      const freq   = (freqHi << 8) | freqLo;
+      this.ch2_freq = 131072 / (2048 - freq);
+      this.ch2_duty = (this.regs[7] >> 6) & 0x03;
+      this.ch2_env_vol = (this.regs[7] >> 4) & 0x0F;
+      this.ch2_on  = true;
+    }
+  }
+
+  dutyTable = [
+    [0,0,0,0,0,0,0,1],
+    [1,0,0,0,0,0,0,1],
+    [1,0,0,0,0,1,1,1],
+    [0,1,1,1,1,1,1,0],
+  ];
+
+  step(tCycles) {
+    if (!this.audioCtx) return;
+    this.cycleAccum += tCycles;
+
+    while (this.cycleAccum >= this.cyclesPerSample) {
+      this.cycleAccum -= this.cyclesPerSample;
+
+      let sample = 0;
+      if (this.ch1_on) {
+        this.ch1_phase = (this.ch1_phase + this.ch1_freq / this.sampleRate) % 1;
+        const idx = Math.floor(this.ch1_phase * 8) & 7;
+        sample += this.dutyTable[this.ch1_duty][idx] * (this.ch1_env_vol / 15) * 0.3;
+      }
+      if (this.ch2_on) {
+        this.ch2_phase = (this.ch2_phase + this.ch2_freq / this.sampleRate) % 1;
+        const idx = Math.floor(this.ch2_phase * 8) & 7;
+        sample += this.dutyTable[this.ch2_duty][idx] * (this.ch2_env_vol / 15) * 0.3;
+      }
+
+      this.sampleBuffer[this.samplePos++] = sample;
+
+      if (this.samplePos >= this.bufferSize) {
+        this.flushBuffer();
+        this.samplePos = 0;
+      }
+    }
+  }
+
+  flushBuffer() {
+    if (!this.audioCtx) return;
+    const buf = this.audioCtx.createBuffer(1, this.bufferSize, this.sampleRate);
+    buf.copyToChannel(this.sampleBuffer, 0);
+    const src = this.audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.gainNode);
+    const time = Math.max(this.audioCtx.currentTime, this.nextFrameTime);
+    src.start(time);
+    this.nextFrameTime = time + this.bufferSize / this.sampleRate;
+  }
+}
+
+// ---- Joypad ----
+class Joypad {
+  constructor() {
+    this.buttons = 0xFF; // all released
+    this.select = 0xFF;
+  }
+
+  read() {
+    return this.select | 0xC0;
+  }
+
+  write(val) {
+    const sel = val & 0x30;
+    if (!(sel & 0x20)) {
+      // Direction
+      this.select = 0x30 | (this.dirByte & 0x0F);
+    } else if (!(sel & 0x10)) {
+      // Buttons
+      this.select = 0x30 | (this.btnByte & 0x0F);
+    } else {
+      this.select = 0xFF;
+    }
+  }
+
+  setKey(key, pressed) {
+    // bit 0=Right/A, 1=Left/B, 2=Up/Select, 3=Down/Start
+    const map = {
+      'ArrowRight': { dir: 0 }, 'ArrowLeft': { dir: 1 },
+      'ArrowUp': { dir: 2 }, 'ArrowDown': { dir: 3 },
+      'KeyZ': { btn: 0 }, 'KeyX': { btn: 1 },
+      'Enter': { btn: 3 }, 'ShiftRight': { btn: 2 },
+      'Space': { btn: 3 }, 'BackSpace': { btn: 2 },
+    };
+    const m = map[key];
+    if (!m) return false;
+    if (m.dir !== undefined) {
+      if (pressed) this.dirByte &= ~(1 << m.dir);
+      else         this.dirByte |= (1 << m.dir);
+    }
+    if (m.btn !== undefined) {
+      if (pressed) this.btnByte &= ~(1 << m.btn);
+      else         this.btnByte |= (1 << m.btn);
+    }
+    return true;
+  }
+
+  dirByte = 0xFF;
+  btnByte = 0xFF;
+}
+
+// ---- MMU ----
+class MMU {
+  constructor(gb) {
+    this.gb = gb;
+    this.wram  = new Uint8Array(0x2000);
+    this.hram  = new Uint8Array(0x7F);
+    this.IE    = 0;
+    this.IF    = 0xE0;
+    this.bootRomEnabled = false;
+    this.serialData = 0;
+    this.serialControl = 0;
+  }
+
+  requestInterrupt(bit) {
+    this.IF |= (1 << bit);
+  }
+
+  read(addr) {
+    addr &= 0xFFFF;
+    if (addr < 0x8000) return this.gb.cart.read(addr);
+    if (addr < 0xA000) return this.gb.ppu.read(addr);
+    if (addr < 0xC000) return this.gb.cart.read(addr);
+    if (addr < 0xE000) return this.wram[addr - 0xC000];
+    if (addr < 0xFE00) return this.wram[(addr - 0xE000) & 0x1FFF]; // echo
+    if (addr < 0xFEA0) return this.gb.ppu.read(addr);
+    if (addr < 0xFF00) return 0xFF; // unusable
+    if (addr === 0xFF00) return this.gb.joypad.read();
+    if (addr === 0xFF01) return this.serialData;
+    if (addr === 0xFF02) return this.serialControl;
+    if (addr >= 0xFF03 && addr <= 0xFF07) return this.gb.timer.read(addr);
+    if (addr === 0xFF0F) return this.IF | 0xE0;
+    if (addr >= 0xFF10 && addr < 0xFF40) return this.gb.apu.read(addr);
+    if (addr >= 0xFF40 && addr <= 0xFF4B) return this.gb.ppu.read(addr);
+    if (addr >= 0xFF80 && addr < 0xFFFF) return this.hram[addr - 0xFF80];
+    if (addr === 0xFFFF) return this.IE;
+    return 0xFF;
+  }
+
+  write(addr, val) {
+    addr &= 0xFFFF; val &= 0xFF;
+    if (addr < 0x8000) { this.gb.cart.write(addr, val); return; }
+    if (addr < 0xA000) { this.gb.ppu.write(addr, val); return; }
+    if (addr < 0xC000) { this.gb.cart.write(addr, val); return; }
+    if (addr < 0xE000) { this.wram[addr - 0xC000] = val; return; }
+    if (addr < 0xFE00) { this.wram[(addr - 0xE000) & 0x1FFF] = val; return; }
+    if (addr < 0xFEA0) { this.gb.ppu.write(addr, val); return; }
+    if (addr < 0xFF00) return;
+    if (addr === 0xFF00) { this.gb.joypad.write(val); return; }
+    if (addr === 0xFF01) { this.serialData = val; return; }
+    if (addr === 0xFF02) { this.serialControl = val; return; }
+    if (addr >= 0xFF03 && addr <= 0xFF07) { this.gb.timer.write(addr, val); return; }
+    if (addr === 0xFF0F) { this.IF = val | 0xE0; return; }
+    if (addr >= 0xFF10 && addr < 0xFF40) { this.gb.apu.write(addr, val); return; }
+    if (addr >= 0xFF40 && addr <= 0xFF4B) { this.gb.ppu.write(addr, val); return; }
+    if (addr >= 0xFF80 && addr < 0xFFFF) { this.hram[addr - 0xFF80] = val; return; }
+    if (addr === 0xFFFF) { this.IE = val; return; }
+  }
+}
+
+// ---- CPU (LR35902) ----
+class CPU {
+  constructor(gb) {
+    this.gb = gb;
+    this.mmu = gb.mmu;
+
+    // Registers (8-bit pairs: AF, BC, DE, HL)
+    this.A = 0x01; this.F = 0xB0;
+    this.B = 0x00; this.C = 0x13;
+    this.D = 0x00; this.E = 0xD8;
+    this.H = 0x01; this.L = 0x4D;
+    this.SP = 0xFFFE;
+    this.PC = 0x0100;
+
+    this.IME = false;     // interrupt master enable
+    this.IMESchedule = 0; // 0=off, 1=next, 2=scheduled
+    this.halted = false;
+    this.cycles = 0;
+  }
+
+  // Flag helpers
+  get fZ() { return (this.F >> 7) & 1; }
+  get fN() { return (this.F >> 6) & 1; }
+  get fH() { return (this.F >> 5) & 1; }
+  get fC() { return (this.F >> 4) & 1; }
+  setF(z, n, h, c) {
+    this.F = (z?0x80:0) | (n?0x40:0) | (h?0x20:0) | (c?0x10:0);
+  }
+
+  // 16-bit register helpers
+  get AF() { return (this.A << 8) | (this.F & 0xF0); }
+  set AF(v) { this.A = (v >> 8) & 0xFF; this.F = v & 0xF0; }
+  get BC() { return (this.B << 8) | this.C; }
+  set BC(v) { this.B = (v >> 8) & 0xFF; this.C = v & 0xFF; }
+  get DE() { return (this.D << 8) | this.E; }
+  set DE(v) { this.D = (v >> 8) & 0xFF; this.E = v & 0xFF; }
+  get HL() { return (this.H << 8) | this.L; }
+  set HL(v) { this.H = (v >> 8) & 0xFF; this.L = v & 0xFF; }
+
+  rb(a) { return this.mmu.read(a); }
+  wb(a, v) { this.mmu.write(a, v & 0xFF); }
+  rw(a) { return this.rb(a) | (this.rb((a+1)&0xFFFF) << 8); }
+  ww(a, v) { this.wb(a, v & 0xFF); this.wb((a+1)&0xFFFF, (v>>8)&0xFF); }
+
+  fetch() {
+    const v = this.rb(this.PC);
+    this.PC = (this.PC + 1) & 0xFFFF;
+    return v;
+  }
+  fetchW() {
+    const v = this.rw(this.PC);
+    this.PC = (this.PC + 2) & 0xFFFF;
+    return v;
+  }
+
+  push(v) {
+    this.SP = (this.SP - 2) & 0xFFFF;
+    this.ww(this.SP, v);
+  }
+  pop() {
+    const v = this.rw(this.SP);
+    this.SP = (this.SP + 2) & 0xFFFF;
+    return v;
+  }
+
+  // Returns M-cycles used
+  step() {
+    // Handle interrupts
+    if (this.IMESchedule > 0) {
+      this.IMESchedule--;
+      if (this.IMESchedule === 0) this.IME = true;
+    }
+
+    const mmu = this.gb.mmu;
+    const irq = mmu.IE & mmu.IF & 0x1F;
+    if (irq) {
+      if (this.halted) this.halted = false;
+      if (this.IME) {
+        this.IME = false;
+        for (let i = 0; i < 5; i++) {
+          if (irq & (1 << i)) {
+            mmu.IF &= ~(1 << i);
+            this.push(this.PC);
+            this.PC = 0x0040 + i * 8;
+            return 5; // 20 T-cycles
+          }
+        }
+      }
+    }
+
+    if (this.halted) return 1; // 4 T-cycles
+
+    return this.execute();
+  }
+
+  execute() {
+    const op = this.fetch();
+    return this.dispatch(op);
+  }
+
+  dispatch(op) {
+    let t = 0;
+    switch(op) {
+      // NOP
+      case 0x00: return 1;
+      // LD r16, d16
+      case 0x01: this.BC = this.fetchW(); return 3;
+      case 0x11: this.DE = this.fetchW(); return 3;
+      case 0x21: this.HL = this.fetchW(); return 3;
+      case 0x31: this.SP = this.fetchW(); return 3;
+      // LD (r16), A
+      case 0x02: this.wb(this.BC, this.A); return 2;
+      case 0x12: this.wb(this.DE, this.A); return 2;
+      case 0x22: { const hl = this.HL; this.wb(hl, this.A); this.HL = (hl+1)&0xFFFF; return 2; }
+      case 0x32: { const hl = this.HL; this.wb(hl, this.A); this.HL = (hl-1)&0xFFFF; return 2; }
+      // LD A, (r16)
+      case 0x0A: this.A = this.rb(this.BC); return 2;
+      case 0x1A: this.A = this.rb(this.DE); return 2;
+      case 0x2A: { const hl = this.HL; this.A = this.rb(hl); this.HL = (hl+1)&0xFFFF; return 2; }
+      case 0x3A: { const hl = this.HL; this.A = this.rb(hl); this.HL = (hl-1)&0xFFFF; return 2; }
+      // INC r16
+      case 0x03: this.BC = (this.BC+1)&0xFFFF; return 2;
+      case 0x13: this.DE = (this.DE+1)&0xFFFF; return 2;
+      case 0x23: this.HL = (this.HL+1)&0xFFFF; return 2;
+      case 0x33: this.SP = (this.SP+1)&0xFFFF; return 2;
+      // DEC r16
+      case 0x0B: this.BC = (this.BC-1)&0xFFFF; return 2;
+      case 0x1B: this.DE = (this.DE-1)&0xFFFF; return 2;
+      case 0x2B: this.HL = (this.HL-1)&0xFFFF; return 2;
+      case 0x3B: this.SP = (this.SP-1)&0xFFFF; return 2;
+      // INC r8
+      case 0x04: this.B = this.inc8(this.B); return 1;
+      case 0x0C: this.C = this.inc8(this.C); return 1;
+      case 0x14: this.D = this.inc8(this.D); return 1;
+      case 0x1C: this.E = this.inc8(this.E); return 1;
+      case 0x24: this.H = this.inc8(this.H); return 1;
+      case 0x2C: this.L = this.inc8(this.L); return 1;
+      case 0x34: this.wb(this.HL, this.inc8(this.rb(this.HL))); return 3;
+      case 0x3C: this.A = this.inc8(this.A); return 1;
+      // DEC r8
+      case 0x05: this.B = this.dec8(this.B); return 1;
+      case 0x0D: this.C = this.dec8(this.C); return 1;
+      case 0x15: this.D = this.dec8(this.D); return 1;
+      case 0x1D: this.E = this.dec8(this.E); return 1;
+      case 0x25: this.H = this.dec8(this.H); return 1;
+      case 0x2D: this.L = this.dec8(this.L); return 1;
+      case 0x35: this.wb(this.HL, this.dec8(this.rb(this.HL))); return 3;
+      case 0x3D: this.A = this.dec8(this.A); return 1;
+      // LD r8, d8
+      case 0x06: this.B = this.fetch(); return 2;
+      case 0x0E: this.C = this.fetch(); return 2;
+      case 0x16: this.D = this.fetch(); return 2;
+      case 0x1E: this.E = this.fetch(); return 2;
+      case 0x26: this.H = this.fetch(); return 2;
+      case 0x2E: this.L = this.fetch(); return 2;
+      case 0x36: this.wb(this.HL, this.fetch()); return 3;
+      case 0x3E: this.A = this.fetch(); return 2;
+      // RLCA, RRCA, RLA, RRA
+      case 0x07: { const c = (this.A >> 7) & 1; this.A = ((this.A << 1) | c) & 0xFF; this.F = c ? 0x10 : 0; return 1; }
+      case 0x0F: { const c = this.A & 1; this.A = ((this.A >> 1) | (c << 7)) & 0xFF; this.F = c ? 0x10 : 0; return 1; }
+      case 0x17: { const c = (this.A >> 7) & 1; this.A = ((this.A << 1) | this.fC) & 0xFF; this.F = c ? 0x10 : 0; return 1; }
+      case 0x1F: { const c = this.A & 1; this.A = ((this.A >> 1) | (this.fC << 7)) & 0xFF; this.F = c ? 0x10 : 0; return 1; }
+      // ADD HL, r16
+      case 0x09: this.addHL(this.BC); return 2;
+      case 0x19: this.addHL(this.DE); return 2;
+      case 0x29: this.addHL(this.HL); return 2;
+      case 0x39: this.addHL(this.SP); return 2;
+      // JR e8
+      case 0x18: { const e = (this.fetch() << 24) >> 24; this.PC = (this.PC + e) & 0xFFFF; return 3; }
+      case 0x20: { const e = (this.fetch() << 24) >> 24; if (!this.fZ) { this.PC = (this.PC + e) & 0xFFFF; return 3; } return 2; }
+      case 0x28: { const e = (this.fetch() << 24) >> 24; if (this.fZ)  { this.PC = (this.PC + e) & 0xFFFF; return 3; } return 2; }
+      case 0x30: { const e = (this.fetch() << 24) >> 24; if (!this.fC) { this.PC = (this.PC + e) & 0xFFFF; return 3; } return 2; }
+      case 0x38: { const e = (this.fetch() << 24) >> 24; if (this.fC)  { this.PC = (this.PC + e) & 0xFFFF; return 3; } return 2; }
+      // STOP / HALT
+      case 0x10: this.fetch(); return 1; // STOP
+      case 0x76: this.halted = true; return 1;
+      // DAA
+      case 0x27: this.daa(); return 1;
+      // CPL
+      case 0x2F: this.A = ~this.A & 0xFF; this.F = (this.F & 0x90) | 0x60; return 1;
+      // SCF
+      case 0x37: this.F = (this.F & 0x80) | 0x10; return 1;
+      // CCF
+      case 0x3F: this.F = (this.F & 0x80) | (this.fC ? 0 : 0x10); return 1;
+      // LD (nn), SP
+      case 0x08: { const a = this.fetchW(); this.ww(a, this.SP); return 5; }
+      // LD HL, SP+e
+      case 0xF8: { const e = (this.fetch() << 24) >> 24; const r = this.SP + e; this.F = ((r & 0xFF) < (this.SP & 0xFF) ? 0x10 : 0) | (((this.SP ^ e ^ r) & 0x10) ? 0x20 : 0); this.HL = r & 0xFFFF; return 3; }
+      // LD SP, HL
+      case 0xF9: this.SP = this.HL; return 2;
+      // LD (nn), A  / LD A, (nn)
+      case 0xEA: this.wb(this.fetchW(), this.A); return 4;
+      case 0xFA: this.A = this.rb(this.fetchW()); return 4;
+      // LDH
+      case 0xE0: this.wb(0xFF00 | this.fetch(), this.A); return 3;
+      case 0xF0: this.A = this.rb(0xFF00 | this.fetch()); return 3;
+      case 0xE2: this.wb(0xFF00 | this.C, this.A); return 2;
+      case 0xF2: this.A = this.rb(0xFF00 | this.C); return 2;
+      // 8-bit loads (LD r, r)
+      case 0x40: return 1; case 0x41: this.B=this.C; return 1; case 0x42: this.B=this.D; return 1; case 0x43: this.B=this.E; return 1;
+      case 0x44: this.B=this.H; return 1; case 0x45: this.B=this.L; return 1; case 0x46: this.B=this.rb(this.HL); return 2; case 0x47: this.B=this.A; return 1;
+      case 0x48: this.C=this.B; return 1; case 0x49: return 1; case 0x4A: this.C=this.D; return 1; case 0x4B: this.C=this.E; return 1;
+      case 0x4C: this.C=this.H; return 1; case 0x4D: this.C=this.L; return 1; case 0x4E: this.C=this.rb(this.HL); return 2; case 0x4F: this.C=this.A; return 1;
+      case 0x50: this.D=this.B; return 1; case 0x51: this.D=this.C; return 1; case 0x52: return 1; case 0x53: this.D=this.E; return 1;
+      case 0x54: this.D=this.H; return 1; case 0x55: this.D=this.L; return 1; case 0x56: this.D=this.rb(this.HL); return 2; case 0x57: this.D=this.A; return 1;
+      case 0x58: this.E=this.B; return 1; case 0x59: this.E=this.C; return 1; case 0x5A: this.E=this.D; return 1; case 0x5B: return 1;
+      case 0x5C: this.E=this.H; return 1; case 0x5D: this.E=this.L; return 1; case 0x5E: this.E=this.rb(this.HL); return 2; case 0x5F: this.E=this.A; return 1;
+      case 0x60: this.H=this.B; return 1; case 0x61: this.H=this.C; return 1; case 0x62: this.H=this.D; return 1; case 0x63: this.H=this.E; return 1;
+      case 0x64: return 1; case 0x65: this.H=this.L; return 1; case 0x66: this.H=this.rb(this.HL); return 2; case 0x67: this.H=this.A; return 1;
+      case 0x68: this.L=this.B; return 1; case 0x69: this.L=this.C; return 1; case 0x6A: this.L=this.D; return 1; case 0x6B: this.L=this.E; return 1;
+      case 0x6C: this.L=this.H; return 1; case 0x6D: return 1; case 0x6E: this.L=this.rb(this.HL); return 2; case 0x6F: this.L=this.A; return 1;
+      case 0x70: this.wb(this.HL,this.B); return 2; case 0x71: this.wb(this.HL,this.C); return 2; case 0x72: this.wb(this.HL,this.D); return 2;
+      case 0x73: this.wb(this.HL,this.E); return 2; case 0x74: this.wb(this.HL,this.H); return 2; case 0x75: this.wb(this.HL,this.L); return 2;
+      case 0x77: this.wb(this.HL,this.A); return 2;
+      case 0x78: this.A=this.B; return 1; case 0x79: this.A=this.C; return 1; case 0x7A: this.A=this.D; return 1; case 0x7B: this.A=this.E; return 1;
+      case 0x7C: this.A=this.H; return 1; case 0x7D: this.A=this.L; return 1; case 0x7E: this.A=this.rb(this.HL); return 2; case 0x7F: return 1;
+      // ALU A, r
+      case 0x80: this.addA(this.B); return 1; case 0x81: this.addA(this.C); return 1; case 0x82: this.addA(this.D); return 1; case 0x83: this.addA(this.E); return 1;
+      case 0x84: this.addA(this.H); return 1; case 0x85: this.addA(this.L); return 1; case 0x86: this.addA(this.rb(this.HL)); return 2; case 0x87: this.addA(this.A); return 1;
+      case 0x88: this.adcA(this.B); return 1; case 0x89: this.adcA(this.C); return 1; case 0x8A: this.adcA(this.D); return 1; case 0x8B: this.adcA(this.E); return 1;
+      case 0x8C: this.adcA(this.H); return 1; case 0x8D: this.adcA(this.L); return 1; case 0x8E: this.adcA(this.rb(this.HL)); return 2; case 0x8F: this.adcA(this.A); return 1;
+      case 0x90: this.subA(this.B); return 1; case 0x91: this.subA(this.C); return 1; case 0x92: this.subA(this.D); return 1; case 0x93: this.subA(this.E); return 1;
+      case 0x94: this.subA(this.H); return 1; case 0x95: this.subA(this.L); return 1; case 0x96: this.subA(this.rb(this.HL)); return 2; case 0x97: this.subA(this.A); return 1;
+      case 0x98: this.sbcA(this.B); return 1; case 0x99: this.sbcA(this.C); return 1; case 0x9A: this.sbcA(this.D); return 1; case 0x9B: this.sbcA(this.E); return 1;
+      case 0x9C: this.sbcA(this.H); return 1; case 0x9D: this.sbcA(this.L); return 1; case 0x9E: this.sbcA(this.rb(this.HL)); return 2; case 0x9F: this.sbcA(this.A); return 1;
+      case 0xA0: this.andA(this.B); return 1; case 0xA1: this.andA(this.C); return 1; case 0xA2: this.andA(this.D); return 1; case 0xA3: this.andA(this.E); return 1;
+      case 0xA4: this.andA(this.H); return 1; case 0xA5: this.andA(this.L); return 1; case 0xA6: this.andA(this.rb(this.HL)); return 2; case 0xA7: this.andA(this.A); return 1;
+      case 0xA8: this.xorA(this.B); return 1; case 0xA9: this.xorA(this.C); return 1; case 0xAA: this.xorA(this.D); return 1; case 0xAB: this.xorA(this.E); return 1;
+      case 0xAC: this.xorA(this.H); return 1; case 0xAD: this.xorA(this.L); return 1; case 0xAE: this.xorA(this.rb(this.HL)); return 2; case 0xAF: this.xorA(this.A); return 1;
+      case 0xB0: this.orA(this.B); return 1; case 0xB1: this.orA(this.C); return 1; case 0xB2: this.orA(this.D); return 1; case 0xB3: this.orA(this.E); return 1;
+      case 0xB4: this.orA(this.H); return 1; case 0xB5: this.orA(this.L); return 1; case 0xB6: this.orA(this.rb(this.HL)); return 2; case 0xB7: this.orA(this.A); return 1;
+      case 0xB8: this.cpA(this.B); return 1; case 0xB9: this.cpA(this.C); return 1; case 0xBA: this.cpA(this.D); return 1; case 0xBB: this.cpA(this.E); return 1;
+      case 0xBC: this.cpA(this.H); return 1; case 0xBD: this.cpA(this.L); return 1; case 0xBE: this.cpA(this.rb(this.HL)); return 2; case 0xBF: this.cpA(this.A); return 1;
+      // ALU A, d8
+      case 0xC6: this.addA(this.fetch()); return 2;
+      case 0xCE: this.adcA(this.fetch()); return 2;
+      case 0xD6: this.subA(this.fetch()); return 2;
+      case 0xDE: this.sbcA(this.fetch()); return 2;
+      case 0xE6: this.andA(this.fetch()); return 2;
+      case 0xEE: this.xorA(this.fetch()); return 2;
+      case 0xF6: this.orA(this.fetch()); return 2;
+      case 0xFE: this.cpA(this.fetch()); return 2;
+      // PUSH / POP
+      case 0xC5: this.push(this.BC); return 4;
+      case 0xD5: this.push(this.DE); return 4;
+      case 0xE5: this.push(this.HL); return 4;
+      case 0xF5: this.push(this.AF); return 4;
+      case 0xC1: this.BC = this.pop(); return 3;
+      case 0xD1: this.DE = this.pop(); return 3;
+      case 0xE1: this.HL = this.pop(); return 3;
+      case 0xF1: this.AF = this.pop(); return 3;
+      // JP
+      case 0xC3: this.PC = this.fetchW(); return 4;
+      case 0xC2: { const a = this.fetchW(); if (!this.fZ) { this.PC = a; return 4; } return 3; }
+      case 0xCA: { const a = this.fetchW(); if (this.fZ)  { this.PC = a; return 4; } return 3; }
+      case 0xD2: { const a = this.fetchW(); if (!this.fC) { this.PC = a; return 4; } return 3; }
+      case 0xDA: { const a = this.fetchW(); if (this.fC)  { this.PC = a; return 4; } return 3; }
+      case 0xE9: this.PC = this.HL; return 1;
+      // CALL
+      case 0xCD: { const a = this.fetchW(); this.push(this.PC); this.PC = a; return 6; }
+      case 0xC4: { const a = this.fetchW(); if (!this.fZ) { this.push(this.PC); this.PC = a; return 6; } return 3; }
+      case 0xCC: { const a = this.fetchW(); if (this.fZ)  { this.push(this.PC); this.PC = a; return 6; } return 3; }
+      case 0xD4: { const a = this.fetchW(); if (!this.fC) { this.push(this.PC); this.PC = a; return 6; } return 3; }
+      case 0xDC: { const a = this.fetchW(); if (this.fC)  { this.push(this.PC); this.PC = a; return 6; } return 3; }
+      // RET
+      case 0xC9: this.PC = this.pop(); return 4;
+      case 0xC0: if (!this.fZ) { this.PC = this.pop(); return 5; } return 2;
+      case 0xC8: if (this.fZ)  { this.PC = this.pop(); return 5; } return 2;
+      case 0xD0: if (!this.fC) { this.PC = this.pop(); return 5; } return 2;
+      case 0xD8: if (this.fC)  { this.PC = this.pop(); return 5; } return 2;
+      case 0xD9: this.PC = this.pop(); this.IME = true; return 4; // RETI
+      // RST
+      case 0xC7: this.push(this.PC); this.PC = 0x00; return 4;
+      case 0xCF: this.push(this.PC); this.PC = 0x08; return 4;
+      case 0xD7: this.push(this.PC); this.PC = 0x10; return 4;
+      case 0xDF: this.push(this.PC); this.PC = 0x18; return 4;
+      case 0xE7: this.push(this.PC); this.PC = 0x20; return 4;
+      case 0xEF: this.push(this.PC); this.PC = 0x28; return 4;
+      case 0xF7: this.push(this.PC); this.PC = 0x30; return 4;
+      case 0xFF: this.push(this.PC); this.PC = 0x38; return 4;
+      // DI / EI
+      case 0xF3: this.IME = false; this.IMESchedule = 0; return 1;
+      case 0xFB: this.IMESchedule = 2; return 1;
+      // ADD SP, e
+      case 0xE8: {
+        const e = (this.fetch() << 24) >> 24;
+        const r = this.SP + e;
+        this.F = ((r & 0xFF) < (this.SP & 0xFF) ? 0x10 : 0) | (((this.SP ^ e ^ r) & 0x10) ? 0x20 : 0);
+        this.SP = r & 0xFFFF;
+        return 4;
+      }
+      // CB prefix
+      case 0xCB: return this.executeCB();
+      default:
+        // Unknown opcode – treat as NOP
+        return 1;
+    }
+  }
+
+  executeCB() {
+    const op = this.fetch();
+    const reg = op & 0x07;
+    const bit = (op >> 3) & 0x07;
+    const kind = op >> 6;
+
+    const get = () => {
+      switch(reg) {
+        case 0: return this.B; case 1: return this.C; case 2: return this.D; case 3: return this.E;
+        case 4: return this.H; case 5: return this.L; case 6: return this.rb(this.HL); case 7: return this.A;
+      }
+    };
+    const set = (v) => {
+      v &= 0xFF;
+      switch(reg) {
+        case 0: this.B=v; break; case 1: this.C=v; break; case 2: this.D=v; break; case 3: this.E=v; break;
+        case 4: this.H=v; break; case 5: this.L=v; break; case 6: this.wb(this.HL,v); break; case 7: this.A=v; break;
+      }
+    };
+
+    const extra = reg === 6 ? 1 : 0; // (HL) takes +1 M-cycle for set/reset/bit
+
+    if (kind === 1) {
+      // BIT
+      const z = !((get() >> bit) & 1);
+      this.F = (z ? 0x80 : 0) | 0x20 | (this.F & 0x10);
+      return 2 + extra;
+    }
+    if (kind === 2) {
+      // RES
+      set(get() & ~(1 << bit));
+      return 2 + extra;
+    }
+    if (kind === 3) {
+      // SET
+      set(get() | (1 << bit));
+      return 2 + extra;
+    }
+
+    // Rotates / shifts (kind === 0)
+    let v = get(), c, r;
+    switch(bit) {
+      case 0: c=(v>>7)&1; r=((v<<1)|c)&0xFF; this.F=(r===0?0x80:0)|(c?0x10:0); break; // RLC
+      case 1: c=v&1; r=((v>>1)|(c<<7))&0xFF; this.F=(r===0?0x80:0)|(c?0x10:0); break; // RRC
+      case 2: c=(v>>7)&1; r=((v<<1)|this.fC)&0xFF; this.F=(r===0?0x80:0)|(c?0x10:0); break; // RL
+      case 3: c=v&1; r=((v>>1)|(this.fC<<7))&0xFF; this.F=(r===0?0x80:0)|(c?0x10:0); break; // RR
+      case 4: c=(v>>7)&1; r=(v<<1)&0xFF; this.F=(r===0?0x80:0)|(c?0x10:0); break; // SLA
+      case 5: c=v&1; r=((v>>1)|(v&0x80))&0xFF; this.F=(r===0?0x80:0)|(c?0x10:0); break; // SRA
+      case 6: r=((v&0x0F)<<4)|((v&0xF0)>>4); this.F=(r===0?0x80:0); break; // SWAP
+      case 7: c=v&1; r=(v>>1)&0xFF; this.F=(r===0?0x80:0)|(c?0x10:0); break; // SRL
+    }
+    set(r);
+    return 2 + extra;
+  }
+
+  // ALU helpers
+  inc8(v) {
+    const r = (v + 1) & 0xFF;
+    this.F = (r===0?0x80:0) | ((r&0x0F)===0?0x20:0) | (this.F & 0x10);
+    return r;
+  }
+  dec8(v) {
+    const r = (v - 1) & 0xFF;
+    this.F = (r===0?0x80:0) | 0x40 | ((v&0x0F)===0?0x20:0) | (this.F & 0x10);
+    return r;
+  }
+  addHL(v) {
+    const hl = this.HL;
+    const r  = hl + v;
+    this.F = (this.F & 0x80) | ((r > 0xFFFF) ? 0x10 : 0) | (((hl ^ v ^ r) & 0x1000) ? 0x20 : 0);
+    this.HL = r & 0xFFFF;
+  }
+  addA(v) {
+    const a = this.A, r = (a + v) & 0xFF;
+    this.F = (r===0?0x80:0) | ((r<a && v!==0||v===0&&false)?0x10:0) | (((a^v^r)&0x10)?0x20:0);
+    // Carry
+    this.F = (r===0?0x80:0) | ((a+v)>0xFF?0x10:0) | (((a^v^r)&0x10)?0x20:0);
+    this.A = r;
+  }
+  adcA(v) {
+    const a = this.A, c = this.fC, r = (a + v + c) & 0xFF;
+    this.F = (r===0?0x80:0) | ((a+v+c)>0xFF?0x10:0) | (((a^v^r)&0x10)?0x20:0);
+    this.A = r;
+  }
+  subA(v) {
+    const a = this.A, r = (a - v) & 0xFF;
+    this.F = (r===0?0x80:0) | 0x40 | (a<v?0x10:0) | (((a^v^r)&0x10)?0x20:0);
+    this.A = r;
+  }
+  sbcA(v) {
+    const a = this.A, c = this.fC, r = (a - v - c) & 0xFF;
+    this.F = (r===0?0x80:0) | 0x40 | ((a-v-c)<0?0x10:0) | (((a^v^r)&0x10)?0x20:0);
+    this.A = r;
+  }
+  andA(v) { this.A &= v; this.F = (this.A===0?0x80:0) | 0x20; }
+  xorA(v) { this.A ^= v; this.F = (this.A===0?0x80:0); }
+  orA(v)  { this.A |= v; this.F = (this.A===0?0x80:0); }
+  cpA(v)  { const r = (this.A - v) & 0xFF; this.F = (r===0?0x80:0) | 0x40 | (this.A<v?0x10:0) | (((this.A^v^r)&0x10)?0x20:0); }
+
+  daa() {
+    let a = this.A;
+    if (!this.fN) {
+      if (this.fH || (a & 0x0F) > 9) a += 0x06;
+      if (this.fC || a > 0x9F) { a += 0x60; this.F |= 0x10; }
+    } else {
+      if (this.fH) a -= 0x06;
+      if (this.fC) a -= 0x60;
+    }
+    this.A = a & 0xFF;
+    this.F = (this.F & 0x50) | (this.A===0?0x80:0);
+  }
+}
+
+// ---- GameBoy Top Level ----
+class GameBoy {
+  constructor() {
+    this.cart   = null;
+    this.mmu    = new MMU(this);
+    this.ppu    = new PPU(this);
+    this.timer  = new Timer(this);
+    this.apu    = new APU(this);
+    this.joypad = new Joypad();
+    this.cpu    = new CPU(this);
+    this.cycleBudget = 0;
+  }
+
+  loadROM(bytes) {
+    this.cart = new Cartridge(bytes);
+    this.reset();
+    this.apu.initAudio();
+    return this.cart.title;
+  }
+
+  reset() {
+    this.mmu.wram.fill(0);
+    this.mmu.hram.fill(0);
+    this.mmu.IE = 0;
+    this.mmu.IF = 0xE0;
+
+    this.ppu.LCDC = 0x91;
+    this.ppu.STAT = 0x85;
+    this.ppu.SCY  = 0; this.ppu.SCX  = 0;
+    this.ppu.LY   = 0; this.ppu.LYC  = 0;
+    this.ppu.WY   = 0; this.ppu.WX   = 0;
+    this.ppu.BGP  = 0xFC; this.ppu.OBP0 = 0xFF; this.ppu.OBP1 = 0xFF;
+    this.ppu.cycles = 0; this.ppu.mode = 2; this.ppu.windowLine = 0;
+
+    this.cpu.A = 0x01; this.cpu.F = 0xB0;
+    this.cpu.B = 0x00; this.cpu.C = 0x13;
+    this.cpu.D = 0x00; this.cpu.E = 0xD8;
+    this.cpu.H = 0x01; this.cpu.L = 0x4D;
+    this.cpu.SP = 0xFFFE;
+    this.cpu.PC = 0x0100;
+    this.cpu.IME = false;
+    this.cpu.IMESchedule = 0;
+    this.cpu.halted = false;
+
+    this.timer.DIV  = 0xABCC;
+    this.timer.TIMA = 0;
+    this.timer.TMA  = 0;
+    this.timer.TAC  = 0;
+  }
+
+  stepFrame() {
+    let cycles = 0;
+    while (cycles < FRAME_CYCLES) {
+      const m = this.cpu.step(); // M-cycles
+      const t = m * 4;           // T-cycles
+      this.timer.step(t);
+      this.ppu.step(t);
+      this.apu.step(t);
+      cycles += t;
+    }
+    return this.ppu.framebuffer;
+  }
+}
+
+// ============================================================
+//  UI Logic
+// ============================================================
+
+const canvas    = document.getElementById('screen');
+const ctx       = canvas.getContext('2d', { alpha: false });
+const statusEl  = document.getElementById('status');
+const startBtn  = document.getElementById('start');
+const romInput  = document.getElementById('rom');
+const fpsEl     = document.getElementById('fps');
+const pcEl      = document.getElementById('pc');
+const fullscreenBtn = document.getElementById('fullscreenBtn');
+
+const imageData = ctx.createImageData(SCREEN_W, SCREEN_H);
+let gb = null;
+let romBytes = null;
+let running  = false;
+let frames   = 0;
+let lastFpsTime = performance.now();
+let animId   = null;
+
+// Recording
+const recCanvas = document.getElementById('rec');
+const recCtx    = recCanvas.getContext('2d', { alpha: false });
+let recorder    = null;
+let recChunks   = [];
+let recording   = false;
+
+romInput.addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const buf = await f.arrayBuffer();
+  romBytes = new Uint8Array(buf);
+  startBtn.disabled = false;
+  document.getElementById('file-name').textContent = f.name;
+});
+
+startBtn.addEventListener('click', () => {
+  if (!romBytes) return;
+  try {
+    gb = new GameBoy();
+    const title = gb.loadROM(romBytes);
+    document.querySelector('h1').textContent = title || 'GAMEBOY';
+    if (animId) cancelAnimationFrame(animId);
+    running = true;
+    loop();
+  } catch(e) {
+    console.error(e);
+    statusEl.textContent = 'Error: ' + e.message;
+  }
+});
+
+function loop() {
+  if (!running || !gb) return;
+
+  // Poll gamepad
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  if (pads[0]) handlePad(pads[0]);
+
+  gb.stepFrame();
+
+  // Render framebuffer to canvas
+  const fb  = gb.ppu.framebuffer;
+  const dat = imageData.data;
+  for (let i = 0; i < SCREEN_W * SCREEN_H; i++) {
+    const px  = fb[i] >>> 0;
+    const off = i * 4;
+    dat[off]     = (px >>> 24) & 0xFF;
+    dat[off + 1] = (px >>> 16) & 0xFF;
+    dat[off + 2] = (px >>>  8) & 0xFF;
+    dat[off + 3] = 0xFF;
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  // Update PC
+  pcEl.textContent = '0x' + gb.cpu.PC.toString(16).padStart(4, '0');
+
+  // FPS
+  frames++;
+  const now = performance.now();
+  if (now - lastFpsTime >= 1000) {
+    document.title = `GB — ${frames} fps`;
+    frames = 0;
+    lastFpsTime = now;
+  }
+
+  // Record mirror
+  recCtx.clearRect(0, 0, recCanvas.width, recCanvas.height);
+  recCtx.drawImage(canvas, 0, 0, SCREEN_W, SCREEN_H, 0, 0, recCanvas.width, recCanvas.height);
+
+  animId = requestAnimationFrame(loop);
+}
+
+// Keyboard input
+const keyMap = {
+  'ArrowRight': true, 'ArrowLeft': true, 'ArrowUp': true, 'ArrowDown': true,
+  'KeyZ': true, 'KeyX': true, 'Enter': true, 'ShiftRight': true,
+  'Space': true, 'BackSpace': true,
+};
+
+window.addEventListener('keydown', e => {
+  if (!gb) return;
+  if (keyMap[e.code]) { e.preventDefault(); gb.joypad.setKey(e.code, true); }
+  // R key: toggle recording
+  if (e.code === 'KeyR' && !e.shiftKey) { e.preventDefault(); recording ? stopRecording() : startRecording(); }
+  if (e.code === 'KeyR' && e.shiftKey)  { e.preventDefault(); stopRecording(); }
+});
+window.addEventListener('keyup', e => {
+  if (!gb) return;
+  if (keyMap[e.code]) { gb.joypad.setKey(e.code, false); }
+});
+
+// Gamepad
+let prevBtns = [], prevAxes = [0, 0];
+const padBtnMap = { 0: 'KeyZ', 1: 'KeyX', 8: 'BackSpace', 9: 'Enter' };
+function handlePad(pad) {
+  pad.buttons.forEach((btn, i) => {
+    const key = padBtnMap[i];
+    if (!key) return;
+    if (btn.pressed && !prevBtns[i]) gb.joypad.setKey(key, true);
+    if (!btn.pressed && prevBtns[i]) gb.joypad.setKey(key, false);
+  });
+  const [ax, ay] = pad.axes;
+  if (ax < -0.5 && prevAxes[0] >= -0.5) gb.joypad.setKey('ArrowLeft', true);
+  if (ax >= -0.5 && prevAxes[0] < -0.5) gb.joypad.setKey('ArrowLeft', false);
+  if (ax > 0.5 && prevAxes[0] <= 0.5)  gb.joypad.setKey('ArrowRight', true);
+  if (ax <= 0.5 && prevAxes[0] > 0.5)  gb.joypad.setKey('ArrowRight', false);
+  if (ay < -0.5 && prevAxes[1] >= -0.5) gb.joypad.setKey('ArrowUp', true);
+  if (ay >= -0.5 && prevAxes[1] < -0.5) gb.joypad.setKey('ArrowUp', false);
+  if (ay > 0.5 && prevAxes[1] <= 0.5)  gb.joypad.setKey('ArrowDown', true);
+  if (ay <= 0.5 && prevAxes[1] > 0.5)  gb.joypad.setKey('ArrowDown', false);
+  prevBtns = pad.buttons.map(b => b.pressed);
+  prevAxes = [ax, ay];
+}
+
+// Fullscreen
+fullscreenBtn.addEventListener('click', () => {
+  if (!document.fullscreenElement) {
+    canvas.requestFullscreen().catch(() => {});
+  } else {
+    document.exitFullscreen();
+  }
+});
+
+// Recording
+function startRecording() {
+  if (recording) return;
+  const stream = recCanvas.captureStream(60);
+  recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9', videoBitsPerSecond: 10_000_000 });
+  recChunks = [];
+  recorder.ondataavailable = e => { if (e.data.size > 0) recChunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(recChunks, { type: 'video/webm' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = 'gb.webm'; a.click();
+    URL.revokeObjectURL(url);
+  };
+  recorder.start();
+  recording = true;
+}
+function stopRecording() {
+  if (!recording || !recorder) return;
+  recorder.stop(); recording = false; recorder = null;
+}
+
+
+    </script>
+  </body>
+</html>
