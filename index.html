@@ -734,32 +734,37 @@ class Joypad {
       this.select = 0xFF;
     }
   }
+setKey(code, pressed) {
+  const map = {
+    // 方向キー
+    'ArrowRight': { dir: 0 },
+    'ArrowLeft':  { dir: 1 },
+    'ArrowUp':    { dir: 2 },
+    'ArrowDown':  { dir: 3 },
 
-  setKey(key, pressed) {
-    // bit 0=Right/A, 1=Left/B, 2=Up/Select, 3=Down/Start
-    const map = {
-      'ArrowRight': { dir: 0 }, 'ArrowLeft': { dir: 1 },
-      'ArrowUp': { dir: 2 }, 'ArrowDown': { dir: 3 },
-      'KeyZ': { btn: 0 }, 'KeyX': { btn: 1 },
-      'Enter': { btn: 3 }, 'ShiftRight': { btn: 2 },
-      'Space': { btn: 3 }, 'BackSpace': { btn: 2 },
-    };
-    const m = map[key];
-    if (!m) return false;
-    if (m.dir !== undefined) {
-      if (pressed) this.dirByte &= ~(1 << m.dir);
-      else         this.dirByte |= (1 << m.dir);
-    }
-    if (m.btn !== undefined) {
-      if (pressed) this.btnByte &= ~(1 << m.btn);
-      else         this.btnByte |= (1 << m.btn);
-    }
-    return true;
+    // ファミコン風
+    'KeyZ':       { btn: 1 }, // B
+    'KeyX':       { btn: 0 }, // A
+    'ShiftLeft':  { btn: 2 }, // Select
+    'ShiftRight': { btn: 2 },
+    'Enter':      { btn: 3 }, // Start
+  };
+
+  const m = map[code];
+  if (!m) return false;
+
+  if (m.dir !== undefined) {
+    if (pressed) this.dirByte &= ~(1 << m.dir);
+    else         this.dirByte |=  (1 << m.dir);
   }
 
-  dirByte = 0xFF;
-  btnByte = 0xFF;
-}
+  if (m.btn !== undefined) {
+    if (pressed) this.btnByte &= ~(1 << m.btn);
+    else         this.btnByte |=  (1 << m.btn);
+  }
+
+  return true;
+}}
 
 // ---- MMU ----
 class MMU {
